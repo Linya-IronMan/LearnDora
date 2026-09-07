@@ -1,0 +1,515 @@
+use core::fmt;
+use std::{borrow::Cow, collections::BTreeMap};
+
+use aligned_vec::{AVec, ConstAlign};
+use chrono::{DateTime, Utc};
+use eyre::Context as _;
+use serde::Deserialize;
+use uuid::Uuid;
+
+use crate::{BuildId, DataflowId, daemon_to_daemon::InterDaemonEvent, id::NodeId};
+
+pub use log::Level as LogLevel;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[must_use]
+pub struct LogMessage {
+    pub build_id: Option<BuildId>,
+    pub dataflow_id: Option<DataflowId>,
+    pub node_id: Option<NodeId>,
+    pub daemon_id: Option<DaemonId>,
+    pub level: LogLevelOrStdout,
+    pub target: Option<String>,
+    pub module_path: Option<String>,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub message: String,
+    pub timestamp: DateTime<Utc>,
+    pub fields: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Deserialize)]
+pub struct LogMessageHelper {
+    build_id: Option<BuildId>,
+    dataflow_id: Option<DataflowId>,
+    node_id: Option<NodeId>,
+    daemon_id: Option<DaemonId>,
+    level: LogLevelOrStdout,
+    target: Option<String>,
+    module_path: Option<String>,
+    file: Option<String>,
+    line: Option<u32>,
+    message: Option<String>,
+    timestamp: DateTime<Utc>,
+    fields: Option<BTreeMap<String, String>>,
+}
+
+impl From<LogMessageHelper> for LogMessage {
+    fn from(helper: LogMessageHelper) -> Self {
+        let fields = helper.fields.as_ref();
+        LogMessage {
+            build_id: helper.build_id.or(fields
+                .and_then(|f| f.get("build_id").cloned())
+                .and_then(|id| Uuid::parse_str(&id).ok().map(BuildId))),
+            dataflow_id: helper.dataflow_id.or(fields
+                .and_then(|f| f.get("dataflow_id").cloned())
+                .and_then(|id| Uuid::parse_str(&id).ok())),
+            node_id: helper
+                .node_id
+                .or(fields.and_then(|f| f.get("node_id").cloned()).map(NodeId)),
+            daemon_id: helper.daemon_id.or(fields
+                .and_then(|f| f.get("daemon_id").cloned())
+                .and_then(|id| DaemonId::from_display_str(&id))),
+            level: helper.level,
+            target: helper
+                .target
+                .or(fields.and_then(|f| f.get("target").cloned())),
+            module_path: helper
+                .module_path
+                .or(fields.and_then(|f| f.get("module_path").cloned())),
+            file: helper.file.or(fields.and_then(|f| f.get("file").cloned())),
+            line: helper.line.or(fields
+                .and_then(|f| f.get("line").cloned())
+                .and_then(|s| s.parse().ok())),
+            message: helper
+                .message
+                .or(fields.and_then(|f| f.get("message").cloned()))
+                .unwrap_or_default(),
+            fields: helper.fields,
+            timestamp: helper.timestamp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum LogLevelOrStdout {
+    #[serde(rename = "stdout")]
+    Stdout,
+    #[serde(untagged)]
+    LogLevel(LogLevel),
+}
+
+impl LogLevelOrStdout {
+    /// Returns true if a message at this level passes the given minimum level filter.
+    ///
+    /// Ordering: Stdout < Error < Warn < Info < Debug < Trace.
+    /// A message passes if its level is "at or above" (i.e. <=) the minimum.
+    pub fn passes(&self, min: &LogLevelOrStdout) -> bool {
+        match (self, min) {
+            (LogLevelOrStdout::Stdout, LogLevelOrStdout::Stdout) => true,
+            (LogLevelOrStdout::Stdout, _) => false,
+            (LogLevelOrStdout::LogLevel(_), LogLevelOrStdout::Stdout) => true,
+            (LogLevelOrStdout::LogLevel(msg), LogLevelOrStdout::LogLevel(max)) => msg <= max,
+        }
+    }
+}
+
+impl From<LogLevel> for LogLevelOrStdout {
+    fn from(level: LogLevel) -> Self {
+        Self::LogLevel(level)
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct NodeError {
+    pub timestamp: uhlc::Timestamp,
+    pub cause: NodeErrorCause,
+    pub exit_status: NodeExitStatus,
+}
+
+impl std::fmt::Display for NodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let NodeErrorCause::FailedToSpawn(err) = &self.cause {
+            return write!(f, "failed to spawn node: {err}");
+        }
+        match &self.exit_status {
+            NodeExitStatus::Success => write!(f, "<success>"),
+            NodeExitStatus::IoError(err) => write!(f, "I/O error while reading exit status: {err}"),
+            NodeExitStatus::ExitCode(code) => write!(f, "exited with code {code}"),
+            NodeExitStatus::Signal(signal) => {
+                let signal_str: Cow<_> = match signal {
+                    1 => "SIGHUP".into(),
+                    2 => "SIGINT".into(),
+                    3 => "SIGQUIT".into(),
+                    4 => "SIGILL".into(),
+                    6 => "SIGABRT".into(),
+                    8 => "SIGFPE".into(),
+                    9 => "SIGKILL".into(),
+                    11 => "SIGSEGV".into(),
+                    13 => "SIGPIPE".into(),
+                    14 => "SIGALRM".into(),
+                    15 => "SIGTERM".into(),
+                    22 => "SIGABRT".into(),
+                    23 => "NSIG".into(),
+                    other => other.to_string().into(),
+                };
+                if matches!(self.cause, NodeErrorCause::GraceDuration) {
+                    write!(
+                        f,
+                        "node was killed by dora because it didn't react to a stop message in time ({signal_str})"
+                    )
+                } else {
+                    write!(f, "exited because of signal {signal_str}")
+                }
+            }
+            NodeExitStatus::Unknown => write!(f, "unknown exit status"),
+        }?;
+
+        match &self.cause {
+            NodeErrorCause::GraceDuration => {} // handled above
+            NodeErrorCause::Cascading { caused_by_node } => write!(
+                f,
+                ". This error occurred because node `{caused_by_node}` exited before connecting to dora."
+            )?,
+            NodeErrorCause::FailedToSpawn(_) => unreachable!(), // handled above
+            NodeErrorCause::Other { stderr } if stderr.is_empty() => {}
+            NodeErrorCause::Other { stderr } => {
+                let line: &str = "---------------------------------------------------------------------------------\n";
+                let stderr = stderr.trim_end();
+                write!(f, " with stderr output:\n{line}{stderr}\n{line}")?
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub enum NodeErrorCause {
+    /// Node was killed because it didn't react to a stop message in time.
+    GraceDuration,
+    /// Node failed because another node failed before,
+    Cascading {
+        caused_by_node: NodeId,
+    },
+    FailedToSpawn(String),
+    Other {
+        stderr: String,
+    },
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub enum NodeExitStatus {
+    Success,
+    IoError(String),
+    ExitCode(i32),
+    Signal(i32),
+    Unknown,
+}
+
+impl NodeExitStatus {
+    pub fn is_success(&self) -> bool {
+        matches!(self, NodeExitStatus::Success)
+    }
+}
+
+impl From<Result<std::process::ExitStatus, std::io::Error>> for NodeExitStatus {
+    fn from(result: Result<std::process::ExitStatus, std::io::Error>) -> Self {
+        match result {
+            Ok(status) => {
+                if status.success() {
+                    NodeExitStatus::Success
+                } else if let Some(code) = status.code() {
+                    Self::ExitCode(code)
+                } else {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        if let Some(signal) = status.signal() {
+                            return Self::Signal(signal);
+                        }
+                    }
+                    Self::Unknown
+                }
+            }
+            Err(err) => Self::IoError(err.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Timestamped<T> {
+    pub inner: T,
+    pub timestamp: uhlc::Timestamp,
+}
+
+impl<T> Timestamped<T>
+where
+    T: serde::Serialize,
+{
+    pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
+        bincode::serialize(self).wrap_err("failed to serialize timestamped message")
+    }
+}
+
+impl Timestamped<InterDaemonEvent> {
+    pub fn deserialize_inter_daemon_event(bytes: &[u8]) -> eyre::Result<Self> {
+        bincode::deserialize(bytes).wrap_err("failed to deserialize InterDaemonEvent")
+    }
+}
+
+pub type SharedMemoryId = String;
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub enum DataMessage {
+    Vec(AVec<u8, ConstAlign<128>>),
+}
+
+impl fmt::Debug for DataMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Vec(v) => f
+                .debug_struct("Vec")
+                .field("len", &v.len())
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct DaemonId {
+    machine_id: Option<String>,
+    uuid: Uuid,
+}
+
+impl DaemonId {
+    pub fn new(machine_id: Option<String>) -> Self {
+        DaemonId {
+            machine_id,
+            uuid: Uuid::now_v7(),
+        }
+    }
+
+    pub fn matches_machine_id(&self, machine_id: &str) -> bool {
+        self.machine_id
+            .as_ref()
+            .map(|id| id == machine_id)
+            .unwrap_or_default()
+    }
+
+    pub fn machine_id(&self) -> Option<&str> {
+        self.machine_id.as_deref()
+    }
+
+    /// Reverse of [`Display`](std::fmt::Display): parse `"{machine_id}-{uuid}"`, or a bare
+    /// `"{uuid}"` when there is no machine id.
+    ///
+    /// Both the machine id (hostnames) and the canonical UUID contain `-`, so
+    /// splitting on a hyphen drops or corrupts a hyphenated machine id. Split
+    /// off the fixed-width 36-char canonical UUID suffix instead
+    /// (dora-rs/dora#2027).
+    ///
+    /// Expects exact `Display` output (no surrounding whitespace). The
+    /// machine-id path requires the canonical 36-char UUID suffix that
+    /// `Display` emits; the bare path accepts any form `Uuid::parse_str`
+    /// recognizes (canonical / simple / urn / braced).
+    pub fn from_display_str(s: &str) -> Option<Self> {
+        // No machine id: the whole string is the UUID.
+        if let Ok(uuid) = Uuid::parse_str(s) {
+            return Some(DaemonId {
+                machine_id: None,
+                uuid,
+            });
+        }
+        // `Display` writes the UUID via `{}` (canonical 36-char hyphenated
+        // form), preceded by `"{machine_id}-"`.
+        const UUID_LEN: usize = 36;
+        let split = s.len().checked_sub(UUID_LEN)?;
+        let uuid = Uuid::parse_str(s.get(split..)?).ok()?;
+        let machine_id = s.get(..split)?.strip_suffix('-')?;
+        Some(DaemonId {
+            machine_id: Some(machine_id.to_string()),
+            uuid,
+        })
+    }
+}
+
+impl std::fmt::Display for DaemonId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(id) = &self.machine_id {
+            write!(f, "{id}-")?;
+        }
+        write!(f, "{}", self.uuid)
+    }
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone, PartialEq, Eq)]
+pub struct GitSource {
+    pub repo: String,
+    pub commit_hash: String,
+    /// Subdirectory of the repository the node lives in (monorepo support).
+    /// Build, env preparation, and spawn are rooted at `<clone>/<subdir>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subdir: Option<String>,
+    /// Hub provenance marker. Set when this git source was desugared from a
+    /// `hub:` reference — it tells the daemon to use confined path
+    /// resolution (no ambient `$PATH` fallback) for the node, and feeds the
+    /// lockfile and `dora hub` commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub: Option<HubProvenance>,
+}
+
+/// Identity of the hub package a git source was resolved from.
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone, PartialEq, Eq)]
+pub struct HubProvenance {
+    /// Index key (`namespace/name`).
+    pub name: String,
+    /// Resolved version.
+    pub version: String,
+    /// Digest of the index entry's manifest at lock time. The commit hash pins
+    /// the *source tree*, but the entrypoint, build command, and typed contract
+    /// (inputs/outputs/types) all live in the (mutable) index entry — so a
+    /// rewritten entry could change any of them for an already-pinned version.
+    /// `--locked` hard-errors if this digest no longer matches. `Option` for
+    /// back-compat with lockfiles written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_digest: Option<String>,
+}
+
+/// Lockfile pin for a `hub:` node resolved to a prebuilt binary artifact
+/// (spec §8.2). Mirrors [`GitSource`] for the binary source form: the
+/// `url`+`sha256` pin the bytes (re-verified on download), and `hub` records
+/// the package/version/manifest provenance for `--locked` tamper detection.
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone, PartialEq, Eq)]
+pub struct BinaryPin {
+    /// Platform the artifact was selected for at lock time (`<os>-<arch>`).
+    pub platform: String,
+    /// Download URL of the prebuilt artifact.
+    pub url: String,
+    /// SHA-256 the download must match.
+    pub sha256: String,
+    /// Hub provenance (index key, version, manifest digest).
+    pub hub: HubProvenance,
+}
+
+// Test roundtrip serialization of LogMessage
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_log_message_serialization() {
+        let log_message = LogMessage {
+            build_id: Some(BuildId(Uuid::new_v4())),
+            dataflow_id: Some(DataflowId::from(Uuid::new_v4())),
+            node_id: Some(NodeId("node-1".to_string())),
+            daemon_id: Some(DaemonId::new(Some("machine-1".to_string()))),
+            level: LogLevelOrStdout::LogLevel(LogLevel::Info),
+            target: Some("target".to_string()),
+            module_path: Some("module::path".to_string()),
+            file: Some("file.rs".to_string()),
+            line: Some(42),
+            message: "This is a log message".to_string(),
+            timestamp: Utc::now(),
+            fields: Some(BTreeMap::from([("key".to_string(), "value".to_string())])),
+        };
+        let serialized = serde_yaml::to_string(&log_message).unwrap();
+        let deserialized: LogMessageHelper = serde_yaml::from_str(&serialized).unwrap();
+        assert_eq!(log_message, LogMessage::from(deserialized));
+    }
+
+    #[test]
+    fn stdout_passes_stdout_filter() {
+        let stdout = LogLevelOrStdout::Stdout;
+        assert!(stdout.passes(&LogLevelOrStdout::Stdout));
+    }
+
+    /// #2027: `DaemonId` must survive a `Display` -> `from_display_str` round
+    /// trip even when the machine id contains `-` (hostnames do). The old
+    /// `splitn(2, '-')` parse split on the first hyphen, which corrupted the
+    /// UUID (itself hyphenated) and silently dropped the daemon id.
+    #[test]
+    fn daemon_id_display_roundtrips_through_parse() {
+        let uuid = Uuid::new_v4();
+        for machine in [None, Some("host"), Some("my-host"), Some("a-b-c-d")] {
+            let id = DaemonId {
+                machine_id: machine.map(str::to_string),
+                uuid,
+            };
+            let parsed = DaemonId::from_display_str(&id.to_string())
+                .unwrap_or_else(|| panic!("failed to parse {id}"));
+            assert_eq!(parsed, id, "round-trip failed for machine_id={machine:?}");
+        }
+    }
+
+    /// A bare (machine-id-less) daemon id round-trips, and garbage does not
+    /// parse to a bogus id.
+    #[test]
+    fn daemon_id_parse_edge_cases() {
+        let uuid = Uuid::new_v4();
+        let bare = DaemonId {
+            machine_id: None,
+            uuid,
+        };
+        assert_eq!(DaemonId::from_display_str(&bare.to_string()), Some(bare));
+        assert_eq!(DaemonId::from_display_str("not-a-daemon-id"), None);
+        assert_eq!(DaemonId::from_display_str(""), None);
+    }
+
+    #[test]
+    fn stdout_fails_non_stdout_filters() {
+        let stdout = LogLevelOrStdout::Stdout;
+        assert!(!stdout.passes(&LogLevelOrStdout::LogLevel(LogLevel::Info)));
+        assert!(!stdout.passes(&LogLevelOrStdout::LogLevel(LogLevel::Warn)));
+        assert!(!stdout.passes(&LogLevelOrStdout::LogLevel(LogLevel::Error)));
+    }
+
+    #[test]
+    fn any_log_level_passes_stdout_filter() {
+        let stdout_filter = LogLevelOrStdout::Stdout;
+        for level in [
+            LogLevel::Error,
+            LogLevel::Warn,
+            LogLevel::Info,
+            LogLevel::Debug,
+            LogLevel::Trace,
+        ] {
+            assert!(
+                LogLevelOrStdout::LogLevel(level).passes(&stdout_filter),
+                "{level:?} should pass stdout filter"
+            );
+        }
+    }
+
+    #[test]
+    fn error_passes_less_verbose_filters() {
+        let error = LogLevelOrStdout::LogLevel(LogLevel::Error);
+        assert!(error.passes(&LogLevelOrStdout::LogLevel(LogLevel::Error)));
+        assert!(error.passes(&LogLevelOrStdout::LogLevel(LogLevel::Warn)));
+        assert!(error.passes(&LogLevelOrStdout::LogLevel(LogLevel::Info)));
+    }
+
+    #[test]
+    fn debug_fails_info_filter() {
+        let debug = LogLevelOrStdout::LogLevel(LogLevel::Debug);
+        assert!(!debug.passes(&LogLevelOrStdout::LogLevel(LogLevel::Info)));
+    }
+
+    #[test]
+    fn same_level_passes_itself() {
+        for level in [
+            LogLevel::Error,
+            LogLevel::Warn,
+            LogLevel::Info,
+            LogLevel::Debug,
+            LogLevel::Trace,
+        ] {
+            let l = LogLevelOrStdout::LogLevel(level);
+            assert!(l.passes(&l), "{level:?} should pass itself");
+        }
+    }
+
+    #[test]
+    fn trace_passes_trace_fails_debug() {
+        let trace = LogLevelOrStdout::LogLevel(LogLevel::Trace);
+        assert!(trace.passes(&LogLevelOrStdout::LogLevel(LogLevel::Trace)));
+        assert!(!trace.passes(&LogLevelOrStdout::LogLevel(LogLevel::Debug)));
+    }
+
+    #[test]
+    fn daemon_id_uses_v7_uuid() {
+        let id = DaemonId::new(None);
+        // v7 UUIDs have version nibble = 7
+        assert_eq!(id.uuid.get_version_num(), 7);
+    }
+}

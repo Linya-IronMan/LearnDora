@@ -1,0 +1,48 @@
+[package]
+name = "dora-message"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+documentation.workspace = true
+readme.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+# Registers `cfg(kani)` for the formal-verification harnesses (`make qa-kani`).
+[lints]
+workspace = true
+
+[dependencies]
+arrow-data = { workspace = true }
+serde = { workspace = true }
+eyre = { workspace = true }
+arrow-schema = { workspace = true, features = ["serde"] }
+tokio = { workspace = true, features = ["sync"] }
+uuid = { workspace = true }
+log = { version = "0.4.21", features = ["serde"] }
+aligned-vec = { version = "0.5.0", features = ["serde"] }
+semver = { workspace = true }
+schemars = "1.0.4"
+uhlc = "0.5.1"
+serde_yaml = { workspace = true }
+serde-with-expand-env = "1.1.0"
+bincode = { workspace = true }
+serde_json = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+getrandom = "0.2"
+dirs = "6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = { workspace = true }
+
+[[bench]]
+name = "message_serde"
+harness = false

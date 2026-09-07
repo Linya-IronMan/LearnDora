@@ -1,0 +1,192 @@
+use super::system::status::daemon_running;
+use super::{Executable, default_tracing};
+use crate::{
+    LOCALHOST,
+    common::{connect_to_coordinator, connect_with_retry, send_control_request},
+};
+use dora_core::topics::DORA_COORDINATOR_PORT_WS_DEFAULT;
+use dora_message::{cli_to_coordinator::ControlRequest, coordinator_to_cli::ControlRequestReply};
+use eyre::{Context, ContextCompat, bail};
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::{fs, net::SocketAddr, path::Path, process::Command, time::Duration};
+
+#[derive(Debug, clap::Args)]
+/// Spawn coordinator and daemon in local mode (with default config)
+pub struct Up {
+    /// Use a custom configuration
+    #[clap(long, hide = true, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+    config: Option<PathBuf>,
+    /// Enable token authentication for the coordinator.
+    ///
+    /// When enabled, the coordinator generates a random token on startup
+    /// and writes it to ~/.config/dora/.dora-token. Clients must present
+    /// this token to connect.
+    #[clap(long)]
+    auth: bool,
+}
+
+impl Executable for Up {
+    fn execute(self) -> eyre::Result<()> {
+        default_tracing()?;
+        up(self.config.as_deref(), self.auth)
+    }
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpConfig {}
+
+pub(crate) fn up(config_path: Option<&Path>, auth: bool) -> eyre::Result<()> {
+    let UpConfig {} = parse_dora_config(config_path)?;
+    let addr: std::net::IpAddr = std::env::var("DORA_COORDINATOR_ADDR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(LOCALHOST);
+    let port: u16 = std::env::var("DORA_COORDINATOR_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DORA_COORDINATOR_PORT_WS_DEFAULT);
+    let coordinator_addr = (addr, port).into();
+    let session = match connect_to_coordinator(coordinator_addr) {
+        Ok(session) => {
+            println!("coordinator already running on {coordinator_addr}");
+            session
+        }
+        Err(_) => {
+            start_coordinator(auth).wrap_err("failed to start dora-coordinator")?;
+
+            connect_with_retry(coordinator_addr, Duration::from_secs(10)).map_err(|err| {
+                eyre::eyre!(
+                    "timed out waiting for coordinator to start at {coordinator_addr}: {err}\n\n  \
+                     hint: is port {port} already in use? Check with `dora status`\n  \
+                     or stop the existing coordinator with `dora down`"
+                )
+            })?
+        }
+    };
+
+    if !daemon_running(&session)? {
+        start_daemon().wrap_err("failed to start dora-daemon")?;
+
+        // wait a bit until daemon is connected
+        let mut i = 0;
+        const WAIT_S: f32 = 0.1;
+        loop {
+            if daemon_running(&session)? {
+                break;
+            }
+            i += 1;
+            if i > 20 {
+                eyre::bail!("daemon not connected after {}s", WAIT_S * i as f32);
+            }
+            std::thread::sleep(Duration::from_secs_f32(WAIT_S));
+        }
+    } else {
+        println!("daemon already running");
+    }
+
+    Ok(())
+}
+
+pub(crate) fn down(
+    config_path: Option<&Path>,
+    coordinator_addr: SocketAddr,
+) -> Result<(), eyre::ErrReport> {
+    let UpConfig {} = parse_dora_config(config_path)?;
+    // Retry connection briefly — the coordinator may still be initializing after `dora up`.
+    let session = connect_with_retry(coordinator_addr, Duration::from_secs(5)).map_err(|_| {
+        eyre::eyre!(
+            "could not connect to coordinator at {coordinator_addr}\n\n  \
+             hint: is it running? Start it with `dora up`"
+        )
+    })?;
+    // send destroy command to dora-coordinator
+    let reply = send_control_request(&session, &ControlRequest::Destroy)?;
+    match reply {
+        ControlRequestReply::DestroyOk => {
+            println!("Coordinator and daemons destroyed successfully");
+        }
+        other => {
+            bail!("unexpected reply to Destroy: {other:?}");
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_dora_config(config_path: Option<&Path>) -> Result<UpConfig, eyre::ErrReport> {
+    let path = config_path.or_else(|| Some(Path::new("dora-config.yml")).filter(|p| p.exists()));
+    let config = match path {
+        Some(path) => {
+            let raw = fs::read_to_string(path)
+                .with_context(|| format!("failed to read `{}`", path.display()))?;
+            serde_yaml::from_str(&raw)
+                .with_context(|| format!("failed to parse `{}`", path.display()))?
+        }
+        None => Default::default(),
+    };
+    Ok(config)
+}
+
+pub(crate) fn dora_executable_path() -> eyre::Result<std::ffi::OsString> {
+    if cfg!(feature = "python") {
+        // When invoked via Python wrapper, argv[1] is the real dora binary path
+        std::env::args_os()
+            .nth(1)
+            .context("could not get dora path from Python wrapper arguments")
+    } else {
+        std::env::current_exe()
+            .map(Into::into)
+            .wrap_err("could not determine dora executable path")
+    }
+}
+
+/// Detach a child process so it survives after the parent exits:
+/// - null stdio prevents broken-pipe crashes when the parent's terminal closes
+/// - new process group prevents terminal signals (SIGHUP/SIGINT) from propagating
+pub(crate) fn detach_process(cmd: &mut Command) {
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+}
+
+fn start_coordinator(auth: bool) -> eyre::Result<()> {
+    let path = dora_executable_path()?;
+    let mut cmd = Command::new(path);
+    cmd.arg("coordinator");
+    cmd.arg("--quiet");
+    if auth {
+        cmd.arg("--auth");
+    }
+    detach_process(&mut cmd);
+    cmd.spawn().wrap_err(
+        "failed to run `dora coordinator`\n\n  \
+         hint: ensure the `dora` binary is in your PATH",
+    )?;
+
+    println!("started dora coordinator");
+
+    Ok(())
+}
+
+fn start_daemon() -> eyre::Result<()> {
+    let path = dora_executable_path()?;
+    let mut cmd = Command::new(path);
+    cmd.arg("daemon");
+    cmd.arg("--quiet");
+    detach_process(&mut cmd);
+    cmd.spawn().wrap_err(
+        "failed to run `dora daemon`\n\n  \
+         hint: ensure the `dora` binary is in your PATH",
+    )?;
+
+    println!("started dora daemon");
+
+    Ok(())
+}

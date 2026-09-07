@@ -1,0 +1,178 @@
+# Dora QA targets
+#
+# Local-first quality gates. Same scripts run in CI.
+# See docs/plan-agentic-qa-strategy.md for the full strategy.
+#
+# The ladder (increasing thoroughness, increasing runtime):
+#
+#   make qa-fast             ~1 min      pre-commit sanity
+#   make qa-full             ~5-10 min   pre-push
+#   make qa-deep             ~15 min     target Tier 1 gate, stronger than today's CI
+#                                        (adds coverage, adversarial, mutants, semver -
+#                                        kept laptop-only, see strategy doc §5)
+#   make qa-nightly         ~3-4 hours  Full parity with .github/workflows/nightly.yml
+#                                        (qa-deep + proptest@1000 + miri + example-smoke
+#                                        + ci-nightly-jobs). After the #1716 rebalance,
+#                                        nightly.yml has 22 test jobs: example-smoke
+#                                        covers 4 (smoke-suite/log-sinks/service-action/
+#                                        streaming); scripts/qa/ci-nightly-jobs.sh drives
+#                                        the 17 remaining with platform-aware dispatch
+#                                        (record-replay, cluster-smoke, cluster-e2e [Linux],
+#                                        cluster-record-replay [Linux],
+#                                        topic-and-top, cpu-affinity [Linux], redb-backend,
+#                                        daemon-reconnect [Linux], state-reconstruction,
+#                                        test-cross-platform, examples, cli-tests,
+#                                        bench-example, cross-check, ros2-bridge [Linux+ROS2],
+#                                        msrv, kani-proofs [skipped if Kani absent]). The
+#                                        22nd, memory-pool-smoke (torch-gated #[ignore]
+#                                        memory-pool tests), is covered locally by
+#                                        `make qa-examples` / smoke-all.sh, not the
+#                                        qa-nightly example-smoke step (which skips
+#                                        #[ignore] tests). Green local run on platform X predicts
+#                                        green CI nightly for platform X's jobs.
+#   make qa-release-gate                 Tier 3 automatable parts (deep + semver;
+#                                        audit/dogfood are human)
+#   make qa-mutation-audit   ~10-18 hrs  full-repo cargo-mutants; deliberate
+#                                        test-quality audit, NOT every nightly
+#
+# Orthogonal to the ladder:
+#
+#   make qa-examples         ~15-20 min  run all smoke-eligible example
+#                                        dataflows end-to-end (wraps
+#                                        scripts/smoke-all.sh). The script
+#                                        skips examples that need CUDA, ROS2,
+#                                        webcam, multi-machine deploy, C/C++
+#                                        toolchains, or interactive CLI --
+#                                        run `scripts/smoke-all.sh -h` to see
+#                                        the SKIP list. Not part of qa-*
+#                                        ladder by design: the ladder
+#                                        excludes dora-examples tests to
+#                                        keep per-commit budgets tight.
+#
+# `make qa-tier1` is a back-compat alias for `make qa-deep`.
+
+.PHONY: qa qa-fast qa-full qa-deep qa-tier1 qa-nightly qa-release-gate qa-mutation-audit \
+        qa-examples qa-cluster-e2e qa-cluster-record-replay \
+        qa-fmt qa-audit qa-unwrap qa-clippy qa-test qa-coverage qa-mutants qa-semver \
+        qa-adversarial qa-kani qa-pgo qa-install qa-pgo-install qa-kani-install
+
+qa: qa-fast
+
+qa-fast:
+	@scripts/qa/all.sh --fast
+
+qa-full:
+	@scripts/qa/all.sh --full
+
+qa-deep:
+	@scripts/qa/all.sh --deep
+
+# Back-compat alias. Prefer `make qa-deep` in new docs/scripts.
+qa-tier1: qa-deep
+
+qa-nightly:
+	@scripts/qa/all.sh --nightly
+
+qa-release-gate:
+	@scripts/qa/all.sh --release-gate
+
+qa-mutation-audit:
+	@scripts/qa/all.sh --mutation-audit
+
+# Run all smoke-eligible example dataflows end-to-end via
+# scripts/smoke-all.sh. Skips examples requiring CUDA, ROS2, webcam,
+# multi-machine deploy, C/C++ toolchains, or interactive CLI.
+# Budget ~15-20 min. Pass flags through, e.g.
+#   make qa-examples ARGS="--rust-only"
+#   make qa-examples ARGS="-v"    # stream dora output live
+qa-examples:
+	@scripts/smoke-all.sh $(ARGS)
+
+# Real-sshd end-to-end test of `dora cluster up/status/down`. Linux-only.
+# Hard-fails if openssh-server is not installed (install via
+# `sudo apt-get install -y openssh-server`). Subset of qa-nightly; this
+# target is here so developers can run just this job locally without
+# invoking the full nightly suite.
+qa-cluster-e2e:
+	@scripts/qa/ci-nightly-jobs.sh cluster-e2e
+
+# Stitches cluster-e2e + record-replay (#2013): record a dataflow spread
+# across a 3-daemon SSH cluster, replay it locally, and validate the replayed
+# state against the seed(42) baseline. Linux-only; same openssh-server
+# requirement as qa-cluster-e2e. Subset of qa-nightly, broken out for local
+# runs.
+qa-cluster-record-replay:
+	@scripts/qa/ci-nightly-jobs.sh cluster-record-replay
+
+# Individual gates
+
+qa-fmt:
+	@cargo fmt --all -- --check
+
+qa-audit:
+	@scripts/qa/audit.sh
+
+qa-unwrap:
+	@scripts/qa/unwrap-budget.sh
+
+qa-clippy:
+	@cargo clippy --all \
+		--exclude dora-node-api-python \
+		--exclude dora-operator-api-python \
+		--exclude dora-ros2-bridge-python \
+		-- -D warnings
+
+qa-test:
+	@cargo test --all \
+		--exclude dora-node-api-python \
+		--exclude dora-operator-api-python \
+		--exclude dora-ros2-bridge-python \
+		--exclude dora-cli-api-python \
+		--exclude dora-examples
+
+qa-coverage:
+	@scripts/qa/coverage.sh
+
+qa-mutants:
+	@scripts/qa/mutants.sh
+
+qa-semver:
+	@scripts/qa/semver.sh
+
+# Adversarial LLM review of current diff (requires codex or claude CLI)
+qa-adversarial:
+	@scripts/qa/adversarial.sh
+
+# Formal verification: run the #[kani::proof] harnesses (cfg(kani)-gated,
+# zero impact on normal builds). A passing proof covers every input in the
+# harness state space, not just sampled values. Budget ~5-10 min cold,
+# <1 min warm. Run when touching files that contain proofs (see
+# docs/formal-verification.md) and in pre-release gating; not part of the
+# per-commit qa-fast loop. Nightly CI runs the same proofs (kani-proofs
+# job). Install via `make qa-kani-install`.
+qa-kani:
+	@scripts/qa/kani.sh
+
+# Profile-Guided Optimization measurement. Build dora-cli with cargo-pgo
+# (instrument -> train on examples/benchmark -> optimize), then run the
+# benchmark twice (baseline vs PGO) and print a side-by-side comparison.
+# Budget ~30-40 min wall time, ~5-10 GB extra target/ artifacts. PGO results
+# don't transfer across OS/arch — run this on your target platform to find
+# out if PGO helps. See dora-rs/dora#331 for the methodology and the
+# macOS-arm64 baseline data point (+25% throughput geomean).
+qa-pgo:
+	@scripts/qa/pgo.sh
+
+# One-shot tool installation
+
+qa-install:
+	cargo install cargo-audit cargo-deny cargo-llvm-cov cargo-mutants cargo-semver-checks
+	rustup component add llvm-tools-preview
+
+qa-pgo-install:
+	cargo install cargo-pgo
+	rustup component add llvm-tools-preview
+
+qa-kani-install:
+	cargo install kani-verifier --locked
+	cargo kani setup

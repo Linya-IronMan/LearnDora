@@ -1,0 +1,468 @@
+# CI workflow — fast Linux-only PR gate (#1716), plus merge-queue gate.
+#
+# Two tiers:
+#
+#   Cheap (every PR, ~5-10 min):
+#     fmt, clippy, check (cargo check --all + --examples),
+#     typos, audit, unwrap-budget, check-license.
+#     These gate entry into the Trunk Merge Queue.
+#
+#   Expensive (push to main, merge-queue batches, workflow_dispatch):
+#     test (build + cargo test + CLI smoke gates),
+#     e2e, contract-tests, bench (perf regression).
+#     These gate the merge itself. Running them only on Trunk's
+#     batched queue branch means 5 PRs share one expensive CI run.
+#
+# Detection of merge-queue runs relies on Trunk's draft-PR queue
+# mode: the queue branch is named `trunk-merge/...` and the
+# `pull_request` event fires with `github.head_ref` pointing at it.
+#
+# Moved to .github/workflows/nightly.yml (runs once daily, ~3-4h):
+#   - test on macos + windows
+#   - examples (all 3 platforms, incl. C/C++/CMake/multi-daemon)
+#   - CLI Tests (all 3 platforms)
+#   - bench-example (all 3 platforms)
+#   - cross-check matrix (8 targets)
+#   - ROS2 bridge examples
+#   - MSRV check
+#
+# Developers who need to verify non-Linux before merge run `make qa-test`
+# or `make qa-examples` locally; everyone else trusts the next-day
+# nightly schedule to surface platform-specific regressions.
+#
+# Repo-wide workflows: all upstream workflows present plus guide.yml.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    # GitHub's default `pull_request` activity types are
+    # `opened, synchronize, reopened`. Including `ready_for_review`
+    # makes the draft -> ready transition fire CI, which gives
+    # us a way to run tests on CI-created PRs (which don't trigger push events)
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pin Rust to 1.92 until static_init (zenoh-shm dep) is fixed for 1.94+
+  RUST_VERSION: "1.92.0"
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: >
+          cargo clippy --all
+          --exclude dora-node-api-python
+          --exclude dora-operator-api-python
+          --exclude dora-ros2-bridge-python
+          -- -D warnings
+
+  # Cheap compile gate on every PR. `cargo check` skips codegen/link,
+  # so it's much faster than the full `test` job below. Exposed as the
+  # `Check` check to the merge queue's required-status-check config.
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-check
+      - name: Check
+        run: cargo check --all
+      # `cargo check --all` does NOT build `[[example]]` targets, so
+      # signature breaks in `dora_cli::build` / `dora_cli::run` ship
+      # silently otherwise — example binaries are a common integration
+      # surface and deserve their own compile gate.
+      - name: Check examples compile
+        run: cargo check --examples
+
+  test:
+    # Linux-only on PR CI (#1716). macOS + Windows coverage runs in nightly.
+    # Developers verify non-Linux platforms locally via `make qa-test`.
+    #
+    # Expensive — skipped on regular PRs. Runs on push to main,
+    # Trunk merge-queue batches, and manual workflow_dispatch.
+    name: Test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'trunk-merge/')
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-test
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -eux
+          df -h
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          docker system prune -af || true
+          df -h
+      - name: Build (excluding Python packages)
+        run: >
+          cargo build --all
+          --exclude dora-node-api-python
+          --exclude dora-operator-api-python
+          --exclude dora-ros2-bridge-python
+      - name: Test
+        run: >
+          cargo test --all
+          --exclude dora-node-api-python
+          --exclude dora-operator-api-python
+          --exclude dora-ros2-bridge-python
+          --exclude dora-cli-api-python
+          --exclude dora-examples
+
+      # ===== Tier 0 CLI smoke gates =====
+      # Fast per-platform checks against the 80% CLI coverage gap in #215.
+      # Each invocation uses the workspace binary built above (target/debug),
+      # so runtime is <10s per platform. Catches argparse regressions,
+      # schema validation drift, and rendering breaks immediately.
+      - name: CLI smoke — argparse & help text
+        shell: bash
+        run: |
+          set -e
+          for sub in run up down build start stop restart list logs top \
+                     topic node param record replay trace doctor status \
+                     new graph expand validate completion inspect self; do
+            cargo run --quiet -p dora-cli -- "$sub" --help > /dev/null
+          done
+          cargo run --quiet -p dora-cli -- --help > /dev/null
+      - name: CLI smoke — dora validate
+        shell: bash
+        run: |
+          cargo run --quiet -p dora-cli -- validate examples/rust-dataflow/dataflow.yml
+          cargo run --quiet -p dora-cli -- validate examples/multiple-daemons/dataflow.yml
+      # Semantic: strict-types must accept a well-typed dataflow and reject
+      # a mismatched one. Protects against the validator silently passing
+      # both cases (e.g. strict mode accidentally becoming a no-op).
+      - name: CLI semantic — dora validate --strict-types
+        shell: bash
+        run: |
+          set -e
+          cargo run --quiet -p dora-cli -- validate --strict-types examples/typed-dataflow/dataflow.yml
+          # Negative: must exit non-zero on intentional type mismatch
+          if cargo run --quiet -p dora-cli -- validate --strict-types tests/fixtures/type-mismatch.yml; then
+            echo "ERROR: --strict-types accepted tests/fixtures/type-mismatch.yml — validator regression"
+            exit 1
+          fi
+      - name: CLI smoke — dora expand
+        shell: bash
+        run: |
+          cargo run --quiet -p dora-cli -- expand examples/module-dataflow/dataflow.yml > /dev/null
+      # Semantic: expand must flatten module references into named nodes
+      # (pipeline.doubler, pipeline.filter come from the pipeline module).
+      # If expand regresses and emits the `modules:` block without inlining,
+      # this catches it.
+      - name: CLI semantic — dora expand flattens modules
+        shell: bash
+        run: |
+          set -e
+          out=$(cargo run --quiet -p dora-cli -- expand examples/module-dataflow/dataflow.yml)
+          for id in sender pipeline.doubler pipeline.filter receiver; do
+            echo "$out" | grep -q "^- id: $id" \
+              || { echo "ERROR: expand output missing node id '$id'"; exit 1; }
+          done
+          # The flattened output must not still contain a top-level modules: block
+          if echo "$out" | grep -q '^modules:'; then
+            echo "ERROR: expand output still contains 'modules:' block — not flattened"
+            exit 1
+          fi
+      - name: CLI smoke — dora graph (mermaid)
+        shell: bash
+        run: |
+          cargo run --quiet -p dora-cli -- graph examples/rust-dataflow/dataflow.yml --mermaid > /dev/null
+          cargo run --quiet -p dora-cli -- graph examples/multiple-daemons/dataflow.yml --mermaid > /dev/null
+      # Semantic: graph output must contain the dataflow's actual node IDs
+      # and mermaid flowchart syntax. Catches renderer regressions that
+      # silently produce empty or malformed diagrams.
+      - name: CLI semantic — dora graph contains expected nodes
+        shell: bash
+        run: |
+          set -e
+          out=$(cargo run --quiet -p dora-cli -- graph examples/rust-dataflow/dataflow.yml --mermaid)
+          echo "$out" | grep -q '^flowchart ' \
+            || { echo "ERROR: graph output missing 'flowchart' header"; exit 1; }
+          for id in rust-node rust-sink rust-status-node; do
+            echo "$out" | grep -q "$id" \
+              || { echo "ERROR: graph output missing node '$id'"; exit 1; }
+          done
+      # Offline shell-completion generation must emit a non-empty script.
+      # Guards against clap_complete wiring regressions (#1800 A2).
+      # Use a here-string instead of `echo "$out" | grep -q`: under
+      # `set -eo pipefail`, `grep -q` exits as soon as it matches (line 1 of
+      # the 3712-line completion script), closing the pipe; `echo` is still
+      # writing, gets SIGPIPE, and `pipefail` fails the whole step.
+      - name: CLI smoke — dora completion
+        shell: bash
+        run: |
+          out=$(cargo run --quiet -p dora-cli -- completion bash)
+          grep -q '_dora' <<<"$out" \
+            || { echo "ERROR: dora completion bash produced no completion script"; exit 1; }
+
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'trunk-merge/')
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build CLI
+        run: cargo build -p dora-cli --release
+      - name: Install CLI
+        run: cp target/release/dora /usr/local/bin/dora
+      - name: Run E2E tests
+        run: >
+          cargo test --test ws-cli-e2e -- --test-threads=1
+        timeout-minutes: 10
+      - name: Run fault-tolerance tests
+        run: >
+          cargo test --test fault-tolerance-e2e -- --test-threads=1
+        timeout-minutes: 15
+      # Regression for #2029: a coordinator drop+restore must NOT kill the
+      # daemon's running nodes. Spawns a real coordinator+daemon, kills the
+      # coordinator mid-run, and asserts the node process survives + is
+      # re-adopted. Lives in `dora-examples` (excluded from the bulk
+      # `cargo test --all` step), so it needs an explicit invocation.
+      - name: Run daemon coordinator-reconnect E2E
+        run: >
+          cargo test -p dora-examples --test daemon-reconnect-e2e -- --test-threads=1
+        timeout-minutes: 15
+      # `dora node` lifecycle E2E (issue #1703). The shared test
+      # binary lives under the `dora-examples` package which the bulk
+      # `cargo test --all` step excludes, so it needs an explicit
+      # invocation here. Filter to the Rust + C++ variants because
+      # the Python variant requires uv (handled in `contract-tests`
+      # below where uv is already installed).
+      - name: Run dora node lifecycle E2E (Rust + C++)
+        # Cargo's TESTNAME positional is single-valued; multiple
+        # substring filters go after `--` for libtest.
+        run: >
+          cargo test -p dora-examples --test node-lifecycle-e2e
+          --
+          --test-threads=1
+          lifecycle_rust lifecycle_cxx
+        timeout-minutes: 15
+      # Finish-straggler watchdog regression (#2270): a deterministic wedge
+      # (source exits, downstream node hangs) must be escalated/killed by the
+      # watchdog rather than hanging until stop_after. Lives in `dora-examples`
+      # (excluded from the bulk `cargo test --all` step), so it needs an
+      # explicit invocation; the test sets DORA_FINISH_DRAIN_GRACE_SECS itself.
+      - name: Run finish-straggler watchdog E2E
+        run: >
+          cargo test -p dora-examples --test finish-straggler-e2e -- --test-threads=1
+        timeout-minutes: 10
+
+  # Semantic contract tests — promoted from nightly per #1632.
+  #
+  # These are the `contract_*` tests in tests/example-smoke.rs added by
+  # PR #1642. Unlike the liveness-oriented `smoke_*` tests (which just
+  # prove the dataflow completed without crashing), each `contract_*`
+  # test asserts a specific feature behavior: validated-pipeline's
+  # SUCCESS marker for exactly 10 doubled values, service-example's
+  # request_id correlation, action-example's feedback-before-result
+  # ordering, streaming-example's fin-triggered session reassembly.
+  #
+  # Promotion rationale (per #1632 criteria):
+  # - deterministic (each test waits for a specific log marker)
+  # - ~75 s total runtime — well under any reasonable PR budget
+  # - Linux-only to dodge the macOS/Windows Python setup overhead
+  # - no privileged execution or multi-host infra needed
+  #
+  # The liveness `smoke_*` siblings (45 tests) stay in nightly — they
+  # exist to catch crash-class regressions, which the contract tests
+  # already cover for the four examples they touch.
+  contract-tests:
+    name: Semantic contract tests
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'trunk-merge/')
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-test
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+      - name: Set up Python venv
+        # contract_streaming_example uses `--uv`; the other three are
+        # Rust-only but share the same test binary so the setup has
+        # to land before any of them run.
+        run: |
+          uv venv --seed -p 3.12
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+          source .venv/bin/activate
+          uv pip install pyarrow
+          uv pip install -e apis/python/node
+      - name: Run semantic contract tests
+        run: >
+          cargo test -p dora-examples --test example-smoke contract_
+          --
+          --test-threads=1
+          --nocapture
+      # Python variant of the lifecycle test piggybacks on this job
+      # because it needs uv (already set up above). See the e2e job
+      # for the Rust + C++ variants.
+      - name: Run dora node lifecycle E2E (Python)
+        run: >
+          cargo test -p dora-examples --test node-lifecycle-e2e
+          --
+          --test-threads=1
+          lifecycle_python
+        timeout-minutes: 15
+
+  # Benchmark regression check — Ubuntu only (intentional).
+  # Upstream dora runs bench on 3 platforms but only for the benchmark
+  # example (not criterion regression). Our `examples` job already runs
+  # the benchmark example on ubuntu + macos. This job runs criterion
+  # crate-level benchmarks with baseline caching, which is OS-specific.
+  bench:
+    name: Benchmark regression check
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'trunk-merge/')
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+
+      # Restore baseline from the most recent main-branch run.
+      # The key uses a fixed prefix; restore-keys enables prefix matching
+      # so the most recent main-branch save is found.
+      - name: Restore baseline
+        id: cache-baseline
+        uses: actions/cache/restore@v5
+        with:
+          path: target/criterion
+          key: bench-baseline-${{ runner.os }}-not-used
+          restore-keys: bench-baseline-${{ runner.os }}-
+
+      # Compile benchmarks first (separates build errors from bench issues)
+      - name: Compile benchmarks
+        run: |
+          cargo bench -p dora-message --no-run
+          cargo bench -p dora-daemon --features bench --no-run
+
+      # Run benchmarks. Criterion automatically compares against any
+      # existing data in target/criterion/ (restored from cache above).
+      - name: Run benchmarks
+        run: |
+          cargo bench -p dora-message 2>/dev/null | tee bench-output.txt
+          cargo bench -p dora-daemon --features bench 2>/dev/null | tee -a bench-output.txt
+
+      # Always post results to step summary
+      - name: Post results
+        if: always()
+        run: |
+          echo "## Benchmark Results" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat bench-output.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "(no output)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # On main branch: save criterion data as the new baseline
+      - name: Cache baseline
+        if: github.ref == 'refs/heads/main' && success()
+        uses: actions/cache/save@v5
+        with:
+          path: target/criterion
+          key: bench-baseline-${{ runner.os }}-${{ github.sha }}
+
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: crate-ci/typos@master
+
+  # ===== Fast supply-chain gates =====
+  # Only the cheap, deterministic QA gates run remotely. The deeper
+  # QA suite (coverage, mutation testing, semver check) is laptop-only
+  # by design — remote runners are too slow to carry it.
+  # See docs/qa-runbook.md for how to run the deep gates locally.
+
+  audit:
+    name: Audit (cargo-audit + cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      - run: make qa-audit
+
+  unwrap-budget:
+    name: Unwrap budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - run: make qa-unwrap
+
+  # ===== License check =====
+  # Restored from upstream dora CI — explicit license validation.
+  # cargo-deny (in the audit job) covers most license policy, but
+  # cargo-lichking provides a complementary check.
+  check-license:
+    name: License check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-lichking
+      - name: Check dependency licenses
+        run: cargo lichking check

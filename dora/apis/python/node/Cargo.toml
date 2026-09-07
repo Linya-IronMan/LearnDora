@@ -1,0 +1,47 @@
+[package]
+version.workspace = true
+name = "dora-node-api-python"
+edition.workspace = true
+rust-version.workspace = true
+documentation.workspace = true
+readme = "README.md"
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false  # PyO3 cdylib, shipped via PyPI as `dora-rs`, not crates.io
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = ["tracing", "metrics", "async"]
+tracing = ["dora-node-api/tracing"]
+metrics = ["dora-node-api/metrics"]
+async = ["pyo3/experimental-async"]
+
+[dependencies]
+dora-node-api = { workspace = true }
+dora-message = { workspace = true }
+dora-operator-api-python = { workspace = true }
+dora-runtime = { workspace = true, features = ["python"] }
+dora-cli = { workspace = true, features = ["python"] }
+chrono = { version = "0.4", features = ["serde"] }
+pyo3.workspace = true
+eyre = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+flume = { workspace = true }
+arrow = { workspace = true, features = ["pyarrow"] }
+pythonize = { workspace = true }
+futures = { workspace = true }
+dora-ros2-bridge-python = { workspace = true }
+dora-download = { workspace = true }
+shared_memory_extended = "0.13.0"
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
+tracing = { workspace = true }
+
+[build-dependencies]
+pyo3-build-config = { workspace = true }
+
+[lib]
+name = "dora"
+crate-type = ["cdylib"]

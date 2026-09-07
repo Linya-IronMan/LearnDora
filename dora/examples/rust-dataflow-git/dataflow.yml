@@ -1,0 +1,34 @@
+# Smoke-tests git-sourced nodes. Pins to a dora commit (not a released
+# tag) so the example runs against matching message-format versions
+# without needing a release. Update `rev:` when a message-format-breaking
+# change lands on main — otherwise the CI job catches the mismatch and
+# signals a compatibility break, which is the whole point of this test.
+nodes:
+  - id: rust-node
+    git: https://github.com/dora-rs/dora.git
+    rev: f40b5e7e8aa10a6faafdcebd37c7e440741722ed
+    build: cargo build -p rust-dataflow-example-node
+    path: target/debug/rust-dataflow-example-node
+    inputs:
+      tick: dora/timer/millis/10
+    outputs:
+      - random
+
+  - id: rust-status-node
+    git: https://github.com/dora-rs/dora.git
+    rev: f40b5e7e8aa10a6faafdcebd37c7e440741722ed
+    build: cargo build -p rust-dataflow-example-status-node
+    path: target/debug/rust-dataflow-example-status-node
+    inputs:
+      tick: dora/timer/millis/100
+      random: rust-node/random
+    outputs:
+      - status
+
+  - id: rust-sink
+    git: https://github.com/dora-rs/dora.git
+    rev: f40b5e7e8aa10a6faafdcebd37c7e440741722ed
+    build: cargo build -p rust-dataflow-example-sink
+    path: target/debug/rust-dataflow-example-sink
+    inputs:
+      message: rust-status-node/status

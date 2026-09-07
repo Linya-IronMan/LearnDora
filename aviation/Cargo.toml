@@ -1,0 +1,50 @@
+[package]
+name = "aviation"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "aviation"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aviation"
+path = "src/main.rs"
+
+[[bin]]
+name = "aviation-dora"
+path = "src/bin/dora.rs"
+required-features = ["dora"]
+
+[[bin]]
+name = "aviation-controller"
+path = "src/bin/controller.rs"
+required-features = ["dora"]
+
+[[bin]]
+name = "plane-war"
+path = "src/bin/plane_war.rs"
+
+[[bin]]
+name = "plane-war-dora"
+path = "src/bin/plane_war_dora.rs"
+required-features = ["dora"]
+
+[features]
+default = []
+dora = ["dep:dora-node-api", "dep:crossbeam-channel", "dep:eyre"]
+
+[dependencies]
+bevy = { version = "0.19.0", features = ["mp3"] }
+rand = "0.9"
+crossbeam-channel = { version = "0.5.15", optional = true }
+eyre = { version = "0.6", optional = true }
+dora-node-api = { git = "https://atomgit.com/dora-rs/dora.git", rev = "25bac6b3e5ed7435f49bd494e0ff4ef81ee0a674", default-features = false, optional = true }
+
+# Enable a small amount of optimization in the dev profile.
+[profile.dev]
+opt-level = 1
+
+# Enable a large amount of optimization in the dev profile for dependencies.
+[profile.dev.package."*"]
+opt-level = 3

@@ -1,0 +1,233 @@
+use eyre::{Context, bail};
+use std::{
+    collections::{BTreeMap, HashSet},
+    net::IpAddr,
+    path::Path,
+};
+
+use dora_core::topics::DORA_COORDINATOR_PORT_WS_DEFAULT;
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterConfig {
+    pub coordinator: CoordinatorConfig,
+    /// Shared Zenoh peer endpoint that all daemons use as a rendezvous
+    /// for cross-daemon discovery (e.g. `tcp/192.168.1.1:5456`). When
+    /// set, `dora cluster up` passes it to every daemon via
+    /// `dora daemon --zenoh-peer <ep>`. The first daemon to bind the
+    /// endpoint serves as the gossip hub; the rest fall through to
+    /// connect-only. Set this when running on networks without working
+    /// multicast (dev containers, hardened deployments, many CI
+    /// runners) — otherwise daemons can't find each other.
+    #[serde(default)]
+    pub zenoh_peer: Option<String>,
+    pub machines: Vec<MachineConfig>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinatorConfig {
+    pub addr: IpAddr,
+    #[serde(default = "default_port")]
+    pub port: u16,
+}
+
+fn default_port() -> u16 {
+    DORA_COORDINATOR_PORT_WS_DEFAULT
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineConfig {
+    pub id: String,
+    pub host: String,
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Custom SSH port. Defaults to the SSH client default (22).
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Custom daemon local-listen port. Defaults to 53291.
+    /// Set when running multiple daemons on the same host
+    /// (see `examples/multiple-daemons`).
+    #[serde(default)]
+    pub daemon_port: Option<u16>,
+    /// Labels for label-based scheduling (e.g. `gpu: "true"`, `arch: arm64`).
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+}
+
+impl ClusterConfig {
+    pub fn load(path: &Path) -> eyre::Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read `{}`", path.display()))?;
+        let config: Self = serde_yaml::from_str(&raw)
+            .with_context(|| format!("failed to parse `{}`", path.display()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> eyre::Result<()> {
+        if self.machines.is_empty() {
+            bail!("cluster config must define at least one machine");
+        }
+        let mut seen = HashSet::new();
+        for m in &self.machines {
+            if m.id.is_empty() {
+                bail!("machine id must not be empty");
+            }
+            if !seen.insert(&m.id) {
+                bail!("duplicate machine id: `{}`", m.id);
+            }
+            if m.host.is_empty() {
+                bail!("machine `{}` host must not be empty", m.id);
+            }
+            // Reject daemon_port = 0: the daemon would bind an ephemeral port
+            // but exports DORA_DAEMON_LOCAL_LISTEN_PORT=0 to spawned nodes
+            // (binaries/cli/src/command/daemon.rs), so they fail to connect.
+            if m.daemon_port == Some(0) {
+                bail!("machine `{}` daemon_port must not be 0", m.id);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn write_yaml(content: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f
+    }
+
+    #[test]
+    fn parse_minimal() {
+        let f = write_yaml(
+            "coordinator:\n  addr: 192.168.1.100\nmachines:\n  - id: arm\n    host: 192.168.1.101\n",
+        );
+        let cfg = ClusterConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.coordinator.port, DORA_COORDINATOR_PORT_WS_DEFAULT);
+        assert_eq!(cfg.machines.len(), 1);
+        assert_eq!(cfg.machines[0].id, "arm");
+        assert!(cfg.machines[0].user.is_none());
+        assert!(cfg.machines[0].port.is_none());
+        assert!(cfg.machines[0].daemon_port.is_none());
+        assert!(cfg.machines[0].labels.is_empty());
+    }
+
+    #[test]
+    fn parse_with_daemon_port() {
+        let f = write_yaml(
+            "coordinator:\n  addr: 10.0.0.1\nmachines:\n  - id: a\n    host: 10.0.0.2\n    daemon_port: 53292\n",
+        );
+        let cfg = ClusterConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.machines[0].daemon_port, Some(53292));
+    }
+
+    #[test]
+    fn reject_invalid_daemon_port() {
+        let f = write_yaml(
+            "coordinator:\n  addr: 10.0.0.1\nmachines:\n  - id: a\n    host: 10.0.0.2\n    daemon_port: 99999\n",
+        );
+        assert!(ClusterConfig::load(f.path()).is_err());
+    }
+
+    #[test]
+    fn reject_zero_daemon_port() {
+        let f = write_yaml(
+            "coordinator:\n  addr: 10.0.0.1\nmachines:\n  - id: a\n    host: 10.0.0.2\n    daemon_port: 0\n",
+        );
+        let err = ClusterConfig::load(f.path()).unwrap_err();
+        assert!(err.to_string().contains("daemon_port must not be 0"));
+    }
+
+    #[test]
+    fn parse_with_zenoh_peer() {
+        let f = write_yaml(
+            "coordinator:\n  addr: 10.0.0.1\nzenoh_peer: tcp/10.0.0.1:5456\nmachines:\n  - id: a\n    host: 10.0.0.2\n",
+        );
+        let cfg = ClusterConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.zenoh_peer.as_deref(), Some("tcp/10.0.0.1:5456"));
+    }
+
+    #[test]
+    fn parse_without_zenoh_peer_defaults_to_none() {
+        let f = write_yaml(
+            "coordinator:\n  addr: 10.0.0.1\nmachines:\n  - id: a\n    host: 10.0.0.2\n",
+        );
+        let cfg = ClusterConfig::load(f.path()).unwrap();
+        assert!(cfg.zenoh_peer.is_none());
+    }
+
+    #[test]
+    fn parse_with_port() {
+        let f = write_yaml(
+            "coordinator:\n  addr: 10.0.0.1\nmachines:\n  - id: a\n    host: 10.0.0.2\n    port: 2222\n",
+        );
+        let cfg = ClusterConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.machines[0].port, Some(2222));
+    }
+
+    #[test]
+    fn reject_invalid_port() {
+        let f = write_yaml(
+            "coordinator:\n  addr: 10.0.0.1\nmachines:\n  - id: a\n    host: 10.0.0.2\n    port: 99999\n",
+        );
+        assert!(ClusterConfig::load(f.path()).is_err());
+    }
+
+    #[test]
+    fn parse_full() {
+        let f = write_yaml(
+            "coordinator:\n  addr: 10.0.0.1\n  port: 7000\nmachines:\n  - id: a\n    host: 10.0.0.2\n    user: bob\n    labels:\n      gpu: \"true\"\n      arch: arm64\n  - id: b\n    host: 10.0.0.3\n",
+        );
+        let cfg = ClusterConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.coordinator.port, 7000);
+        assert_eq!(cfg.machines.len(), 2);
+        assert_eq!(cfg.machines[0].user.as_deref(), Some("bob"));
+        assert_eq!(
+            cfg.machines[0].labels.get("gpu").map(|s| s.as_str()),
+            Some("true")
+        );
+        assert_eq!(
+            cfg.machines[0].labels.get("arch").map(|s| s.as_str()),
+            Some("arm64")
+        );
+    }
+
+    #[test]
+    fn reject_duplicate_ids() {
+        let f = write_yaml(
+            "coordinator:\n  addr: 10.0.0.1\nmachines:\n  - id: dup\n    host: a\n  - id: dup\n    host: b\n",
+        );
+        let err = ClusterConfig::load(f.path()).unwrap_err();
+        assert!(err.to_string().contains("duplicate machine id"));
+    }
+
+    #[test]
+    fn reject_empty_machines() {
+        let f = write_yaml("coordinator:\n  addr: 10.0.0.1\nmachines: []\n");
+        let err = ClusterConfig::load(f.path()).unwrap_err();
+        assert!(err.to_string().contains("at least one machine"));
+    }
+
+    #[test]
+    fn reject_empty_id() {
+        let f =
+            write_yaml("coordinator:\n  addr: 10.0.0.1\nmachines:\n  - id: \"\"\n    host: a\n");
+        let err = ClusterConfig::load(f.path()).unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn reject_unknown_field() {
+        let f = write_yaml(
+            "coordinator:\n  addr: 10.0.0.1\n  bogus: true\nmachines:\n  - id: a\n    host: b\n",
+        );
+        assert!(ClusterConfig::load(f.path()).is_err());
+    }
+}

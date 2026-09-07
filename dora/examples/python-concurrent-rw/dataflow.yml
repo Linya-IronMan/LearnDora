@@ -1,0 +1,16 @@
+nodes:
+  - id: node1
+    build: pip install numpy pyarrow
+    path: ./receive_data.py
+    inputs:
+      data: node2/data
+    outputs:
+      - data
+
+  - id: node2
+    build: pip install numpy pyarrow
+    path: ./receive_data.py
+    inputs:
+      data: node1/data
+    outputs:
+      - data
