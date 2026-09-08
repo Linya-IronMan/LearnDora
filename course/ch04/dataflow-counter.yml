@@ -1,0 +1,15 @@
+
+nodes:
+  - id: counter
+    path: counter.py
+    inputs:
+      tick: dora/timer/secs/1        # 每秒数一次
+    outputs:
+      - data
+    env:
+      START: 100                     # 从 100 开始
+      STEP: 10                       # 每次加 10
+  - id: printer
+    path: printer.py
+    inputs:
+      data: counter/data

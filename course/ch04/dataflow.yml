@@ -1,5 +1,6 @@
 # dataflow.yml —— 把三个节点串成一条数据流
 nodes:
+
   # 节点一：发送者
   - id: sender                       # 节点的唯一名字
     path: sender.py                  # 怎么启动它：运行这个 Python 文件
@@ -7,6 +8,9 @@ nodes:
       tick: dora/timer/millis/500    # 内置定时器：每 500 毫秒发一次 tick
     outputs:
       - data                         # 声明：我会往一个叫 data 的输出写东西
+    env:
+      ON_TEXT: "绿"
+      OFF_TEXT: "红"
 
   # 节点二：回声
   - id: echo

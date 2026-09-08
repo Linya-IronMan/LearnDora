@@ -1,0 +1,8 @@
+nodes:
+  - id: heartbeat
+    path: heartbeat.py
+    inputs:
+      tick: dora/timer/secs/3      # 每 3 秒一次
+    outputs: []
+    env:
+      MESSAGE: 小莫还活着~
