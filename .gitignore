@@ -5,5 +5,8 @@
 
 target/
 out/
+out/log_*.jsonl
+
+*.pyc
 
 *.log

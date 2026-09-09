@@ -24,4 +24,6 @@ nodes:
   - id: printer
     path: printer.py
     inputs:
-      data: echo/data                # 我的 data 输入，来自 echo 的 data 输出
+      sender: sender/data
+      echo: echo/data
+      # data: [sender/data, echo/data]                # 我的 data 输入，来自 echo 的 data 输出
