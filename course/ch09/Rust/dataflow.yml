@@ -1,0 +1,19 @@
+nodes:
+  # Rust 高频处理节点
+  - id: processor
+    build: cargo build --manifest-path processor/Cargo.toml   # 编译 Rust
+    path: /Users/linya/Code/.cargo-target/debug/processor
+    inputs:
+      tick: dora/timer/millis/1        # 每毫秒一次 = 每秒 1000 次！
+    outputs:
+      - value
+    output_types:
+      value: std/core/v1/Float32       # 声明输出类型
+
+  # Python 可视化节点
+  - id: plot
+    path: plot.py
+    inputs:
+      value: processor/value           # 订阅 Rust 的输出
+    input_types:
+      value: std/core/v1/Float32       # 声明输入类型

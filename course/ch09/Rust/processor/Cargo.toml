@@ -1,0 +1,8 @@
+[package]
+name = "processor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dora-node-api = "1.0.1"          # DORA Rust 节点库
+eyre = "0.3"                     # 错误处理
